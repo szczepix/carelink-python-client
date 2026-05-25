@@ -102,10 +102,85 @@ def reformat_csr(csr):
 	csr = base64.urlsafe_b64encode(csr_raw).decode()
 	return csr
 
+def _build_webdriver():
+    """Open the OS default browser via selenium-wire, with fallbacks.
+
+    On Windows the default browser is read from the registry; Chromium-based
+    browsers (Vivaldi/Brave/Opera/Edge) are driven through the Chrome driver
+    with the right binary. If detection or launch fails, falls back to
+    Chrome -> Edge -> Firefox (whichever is installed).
+    """
+    import os
+    import sys
+
+    def chrome_with(binary=None):
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        opts = ChromeOptions()
+        if binary:
+            opts.binary_location = binary
+        return webdriver.Chrome(options=opts)
+
+    def edge():
+        return webdriver.Edge()
+
+    def firefox():
+        return webdriver.Firefox()
+
+    # exe name -> friendly label for Chromium-family browsers
+    chromium = {
+        "chrome.exe": "Chrome", "msedge.exe": "Edge", "vivaldi.exe": "Vivaldi",
+        "brave.exe": "Brave", "opera.exe": "Opera", "opera_gx.exe": "Opera",
+        "chromium.exe": "Chromium", "thorium.exe": "Thorium",
+    }
+
+    builders = []  # ordered list of (label, callable)
+
+    # 1) Windows: detect the default https handler from the registry
+    if sys.platform.startswith("win"):
+        try:
+            import re
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice") as k:
+                progid = winreg.QueryValueEx(k, "ProgId")[0]
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid + r"\shell\open\command") as k:
+                cmd = winreg.QueryValueEx(k, "")[0]
+            m = re.search(r'"([^"]+\.exe)"', cmd) or re.search(r'(\S+\.exe)', cmd)
+            exe = m.group(1) if m else ""
+            name = os.path.basename(exe).lower()
+            print("detected default browser: %s (progid %s)" % (name or "unknown", progid))
+            if name == "firefox.exe":
+                builders.append(("default:Firefox", firefox))
+            elif name == "msedge.exe":
+                builders.append(("default:Edge", edge))
+            elif name == "chrome.exe":
+                builders.append(("default:Chrome", chrome_with))
+            elif name in chromium:
+                builders.append(("default:" + chromium[name], lambda b=exe: chrome_with(b)))
+        except Exception as e:
+            print("could not detect default browser: %s" % e)
+
+    # 2) Generic fallbacks (use whatever is installed)
+    builders += [("Chrome", chrome_with), ("Edge", edge), ("Firefox", firefox)]
+
+    last_err = None
+    seen = set()
+    for label, build in builders:
+        if label.split(":")[-1] in seen:
+            continue
+        seen.add(label.split(":")[-1])
+        try:
+            print("launching browser via %s ..." % label)
+            return build()
+        except Exception as e:
+            last_err = e
+            print("  %s failed: %s" % (label, e))
+    raise RuntimeError("no usable browser/webdriver found; last error: %s" % last_err)
+
+
 def do_captcha(url, redirect_url):
-	print("opening Firefox instance...")
-	print("Warning: you may need to close Firefox if it's already running or nothing happens!")
-	driver = webdriver.Firefox()
+	print("Warning: you may need to close the browser if it's already running or nothing happens!")
+	driver = _build_webdriver()
 	driver.get(url)
 
 	while True:
