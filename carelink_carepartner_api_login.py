@@ -102,10 +102,85 @@ def reformat_csr(csr):
 	csr = base64.urlsafe_b64encode(csr_raw).decode()
 	return csr
 
+def _build_webdriver():
+    """Open the OS default browser via selenium-wire, with fallbacks.
+
+    On Windows the default browser is read from the registry; Chromium-based
+    browsers (Vivaldi/Brave/Opera/Edge) are driven through the Chrome driver
+    with the right binary. If detection or launch fails, falls back to
+    Chrome -> Edge -> Firefox (whichever is installed).
+    """
+    import os
+    import sys
+
+    def chrome_with(binary=None):
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        opts = ChromeOptions()
+        if binary:
+            opts.binary_location = binary
+        return webdriver.Chrome(options=opts)
+
+    def edge():
+        return webdriver.Edge()
+
+    def firefox():
+        return webdriver.Firefox()
+
+    # exe name -> friendly label for Chromium-family browsers
+    chromium = {
+        "chrome.exe": "Chrome", "msedge.exe": "Edge", "vivaldi.exe": "Vivaldi",
+        "brave.exe": "Brave", "opera.exe": "Opera", "opera_gx.exe": "Opera",
+        "chromium.exe": "Chromium", "thorium.exe": "Thorium",
+    }
+
+    builders = []  # ordered list of (label, callable)
+
+    # 1) Windows: detect the default https handler from the registry
+    if sys.platform.startswith("win"):
+        try:
+            import re
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice") as k:
+                progid = winreg.QueryValueEx(k, "ProgId")[0]
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid + r"\shell\open\command") as k:
+                cmd = winreg.QueryValueEx(k, "")[0]
+            m = re.search(r'"([^"]+\.exe)"', cmd) or re.search(r'(\S+\.exe)', cmd)
+            exe = m.group(1) if m else ""
+            name = os.path.basename(exe).lower()
+            print("detected default browser: %s (progid %s)" % (name or "unknown", progid))
+            if name == "firefox.exe":
+                builders.append(("default:Firefox", firefox))
+            elif name == "msedge.exe":
+                builders.append(("default:Edge", edge))
+            elif name == "chrome.exe":
+                builders.append(("default:Chrome", chrome_with))
+            elif name in chromium:
+                builders.append(("default:" + chromium[name], lambda b=exe: chrome_with(b)))
+        except Exception as e:
+            print("could not detect default browser: %s" % e)
+
+    # 2) Generic fallbacks (use whatever is installed)
+    builders += [("Chrome", chrome_with), ("Edge", edge), ("Firefox", firefox)]
+
+    last_err = None
+    seen = set()
+    for label, build in builders:
+        if label.split(":")[-1] in seen:
+            continue
+        seen.add(label.split(":")[-1])
+        try:
+            print("launching browser via %s ..." % label)
+            return build()
+        except Exception as e:
+            last_err = e
+            print("  %s failed: %s" % (label, e))
+    raise RuntimeError("no usable browser/webdriver found; last error: %s" % last_err)
+
+
 def do_captcha(url, redirect_url):
-	print("opening Firefox instance...")
-	print("Warning: you may need to close Firefox if it's already running or nothing happens!")
-	driver = webdriver.Firefox()
+	print("Warning: you may need to close the browser if it's already running or nothing happens!")
+	driver = _build_webdriver()
 	driver.get(url)
 
 	while True:
@@ -115,8 +190,10 @@ def do_captcha(url, redirect_url):
 					if "location" in request.response.headers:
 						location = request.response.headers["location"]
 						if redirect_url in location:
-							code = re.search(r"code=(.*)&", location).group(1)
-							state = re.search(r"state=(.*)", location).group(1)
+							code = re.search(r"code=(.*)", location).group(1)
+							state = None
+							if "state=" in location:
+								state = re.search(r"state=(.*)", location).group(1)
 							driver.quit()
 							return (code, state)
 		sleep(0.1)
@@ -125,27 +202,38 @@ def resolve_endpoint_config(discovery_url, is_us_region=False):
 	discover_resp = json.loads(requests.get(discovery_url).text)
 	sso_url = None
 
+	is_auth0 = False
+
 	for c in discover_resp["CP"]:
 		if c['region'].lower() == "us" and is_us_region:
-			sso_url = c['SSOConfiguration']
+			key = c['UseSSOConfiguration']
+			sso_url = c[key]
+			if "Auth0" in key:
+				is_auth0 = True
 		elif c['region'].lower() == "eu" and not is_us_region:
-			sso_url = c['SSOConfiguration']
+			key = c['UseSSOConfiguration']
+			sso_url = c[key]
+			if "Auth0" in key:
+				is_auth0 = True
 		
 	if sso_url is None:
 		raise Exception("Could not get SSO config url")
 	
 	sso_config = json.loads(requests.get(sso_url).text)
 	api_base_url = f"https://{sso_config['server']['hostname']}:{sso_config['server']['port']}/{sso_config['server']['prefix']}"
-	return sso_config, api_base_url
+	if api_base_url.endswith('/'):
+		api_base_url = api_base_url[:-1]
+	return sso_config, api_base_url, is_auth0
 
 def write_datafile(obj, filename):
 	print("wrote data file")
 	with open(filename, 'w') as f:
 		json.dump(obj, f, indent=4)
 
-def do_login(endpoint_config):
-	sso_config, api_base_url = endpoint_config
-	# step 1 initialize
+def do_login_non_auth0(endpoint_config):
+	sso_config, api_base_url, is_auth0 = endpoint_config
+
+		# step 1 initialize
 	data = {
 		'client_id': sso_config['oauth']['client']['client_ids'][0]['client_id'],
 		"nonce" :  random_uuid()
@@ -241,6 +329,56 @@ def do_login(endpoint_config):
 	write_datafile(token_data, logindata_file)
 	return token_data
 
+def do_login_auth0(endpoint_config):
+    sso_config, api_base_url, is_auth0 = endpoint_config
+    auth_params = {
+		'client_id': sso_config['client']['client_id'],
+		'response_type' : 'code',
+		'scope': sso_config["client"]["scope"],
+		'redirect_uri': sso_config["client"]['redirect_uri'],
+		'audience': sso_config["client"]["audience"]
+	}
+    authorize_url = (
+        api_base_url + sso_config["system_endpoints"]["authorization_endpoint_path"]
+    )
+    captcha_url = f"{authorize_url}?{'&'.join(f'{key}={value}' for key, value in auth_params.items())}"
+    captcha_code, captcha_sso_state = do_captcha(
+        captcha_url, sso_config["client"]["redirect_uri"]
+    )
+
+    token_req_url = api_base_url + sso_config["system_endpoints"]["token_endpoint_path"]
+    token_req_data = {
+        "grant_type": "authorization_code",
+        "client_id": sso_config["client"]["client_id"],
+        "code": captcha_code,
+        "redirect_uri": sso_config["client"]["redirect_uri"],
+    }
+    token_req = requests.post(token_req_url, data=token_req_data)
+    if token_req.status_code != 200:
+        print(f"\n\n{curlify.to_curl(token_req.request)}")
+        print(token_req.text)
+        raise Exception("Could not get token data")
+
+    token_data = json.loads(token_req.text)
+    print(f"got token data from server")
+
+    print(token_data)
+
+    token_data["client_id"] = token_req_data["client_id"]
+    del token_data["expires_in"]
+    del token_data["token_type"]
+
+    write_datafile(token_data, logindata_file)
+    return token_data
+
+def do_login(endpoint_config):
+	sso_config, api_base_url, is_auth0 = endpoint_config
+
+	if is_auth0:
+		return do_login_auth0(endpoint_config)
+	else:
+		return do_login_non_auth0(endpoint_config)
+
 def read_data_file(file):
 	token_data = None
 	if os.path.isfile(file):
@@ -260,7 +398,7 @@ def read_data_file(file):
 # config
 is_debug = False
 logindata_file = 'logindata.json'
-discovery_url = 'https://clcloud.minimed.eu/connect/carepartner/v11/discover/android/3.2'
+discovery_url = 'https://clcloud.minimed.eu/connect/carepartner/v13/discover/android/3.6'
 rsa_keysize = 2048
 
 def main(is_us_region):
